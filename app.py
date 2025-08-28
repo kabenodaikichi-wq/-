@@ -195,7 +195,7 @@ const App = () => {
       comments: newStaffComments,
     };
     setStaff([...staff, newStaff]);
-    setToastMessage(`${trimmedName} を追加しました。`);
+    setToastMessage(`${trimmedName} を追加しました`);
     setToastType('success');
     setShowToast(true);
     setTimeout(() => setShowToast(false), 3000);
