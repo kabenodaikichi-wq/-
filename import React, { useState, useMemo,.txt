@@ -1,0 +1,1003 @@
+import React, { useState, useMemo, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, getDoc } from 'firebase/firestore';
+
+// メインアプリケーションコンポーネント
+const App = () => {
+  // 曜日リスト
+  const daysOfWeek = ['日', '月', '火', '水', '木', '金', '土'];
+  
+  // 各曜日に必要なスタッフ数と勤務時間
+  const staffNeededPerDay = { '火': 1, '水': 1, '木': 1, '金': 1, '土': 2, '日': 1, '月': 0 };
+  const workingHoursPerDay = {
+    '火': ['18:00-22:00'],
+    '水': ['18:00-22:00'],
+    '木': ['18:00-22:00'],
+    '金': ['17:00-22:00'],
+    '土': ['17:00-22:00', '19:00-23:00'],
+    '日': ['17:00-22:00'],
+    '月': ['定休日'],
+  };
+
+  // State to manage staff names and availability
+  const [staffs, setStaffs] = useState([]);
+  // State for new staff input fields
+  const [newStaff, setNewStaff] = useState({ name: '', type: '選択', canWorkLate: true });
+  // State to manage the generated shift
+  const [generatedShift, setGeneratedShift] = useState({});
+  // State to toggle the shift display
+  const [showResult, setShowResult] = useState(false);
+  // State to manage the staff editing modal visibility
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  // State for the staff currently being edited
+  const [staffToEdit, setStaffToEdit] = useState(null);
+  // State for temporary data in the edit modal
+  const [tempEditData, setTempEditData] = useState(null);
+  // State for custom alert visibility
+  const [customAlert, setCustomAlert] = useState({ visible: false, message: '' });
+  // State to manage confirmation modal visibility (for deletion)
+  const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false);
+  // State to hold the ID of the staff to be deleted
+  const [staffToDeleteId, setStaffToDeleteId] = useState(null);
+  // State to manage the current month of the calendar
+  const [currentDate, setCurrentDate] = useState(new Date());
+  // State to manage the selected shift generation period
+  const [selectedPeriod, setSelectedPeriod] = useState('full');
+  // State to manage auth status and DB instance
+  const [userId, setUserId] = useState(null);
+  const [db, setDb] = useState(null);
+  // State to manage loading status
+  const [isLoading, setIsLoading] = useState(true);
+  const [isXLSXLoaded, setIsXLSXLoaded] = useState(false);
+
+  // グローバル変数からFirebase設定を取得
+  const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+  const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+  // カスタムアラートを表示する関数
+  const showCustomAlert = (message) => {
+    setCustomAlert({ visible: true, message });
+    setTimeout(() => {
+      setCustomAlert({ visible: false, message: '' });
+    }, 3000);
+  };
+  
+  // XLSXライブラリをCDNからロード
+  useEffect(() => {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js';
+    script.onload = () => {
+      setIsXLSXLoaded(true);
+      console.log('XLSXライブラリが正常にロードされました。');
+    };
+    script.onerror = () => {
+      console.error('XLSXライブラリのロードに失敗しました。');
+      showCustomAlert('Excel出力ライブラリの読み込みに失敗しました。');
+    };
+    document.head.appendChild(script);
+    return () => {
+      document.head.removeChild(script);
+    };
+  }, []);
+
+  // Firebaseの初期化と認証
+  useEffect(() => {
+    const initFirebase = async () => {
+      try {
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const firestore = getFirestore(app);
+        setDb(firestore);
+
+        const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+          if (user) {
+            setUserId(user.uid);
+          } else {
+            try {
+              if (initialAuthToken) {
+                const userCredential = await signInWithCustomToken(auth, initialAuthToken);
+                setUserId(userCredential.user.uid);
+              } else {
+                const userCredential = await signInAnonymously(auth);
+                setUserId(userCredential.user.uid);
+              }
+            } catch (error) {
+              console.error('認証に失敗しました:', error);
+              showCustomAlert('認証に失敗しました。');
+            }
+          }
+          setIsLoading(false);
+        });
+
+        return () => unsubscribeAuth();
+      } catch (error) {
+        console.error('Firebaseの初期化に失敗しました:', error);
+        setIsLoading(false);
+        showCustomAlert('アプリの初期化に失敗しました。');
+      }
+    };
+    initFirebase();
+  }, [initialAuthToken]);
+  
+  // Firestoreからのリアルタイムデータ購読
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    const docRef = doc(db, 'artifacts', appId, 'users', userId, 'shift_data', 'user_data');
+    
+    const unsubscribeSnapshot = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.staffs) {
+          setStaffs(data.staffs);
+        }
+        if (data.generatedShift && Object.keys(data.generatedShift).length > 0) {
+          setGeneratedShift(data.generatedShift);
+          setShowResult(true);
+        } else {
+          setGeneratedShift({});
+          setShowResult(false);
+        }
+      } else {
+        setStaffs([]);
+        setGeneratedShift({});
+        setShowResult(false);
+      }
+    }, (error) => {
+      console.error("Firestoreからデータを取得できませんでした:", error);
+      showCustomAlert('データの読み込みに失敗しました。');
+    });
+
+    return () => unsubscribeSnapshot();
+  }, [db, userId, appId]);
+
+  // 特定の月のカレンダー日付を生成するヘルパー関数
+  const generateDates = (year, month) => {
+    const dates = [];
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const firstDay = new Date(year, month, 1).getDay();
+    for (let i = 0; i < firstDay; i++) {
+      dates.push(null);
+    }
+    for (let i = 1; i <= daysInMonth; i++) {
+      dates.push(i);
+    }
+    return dates;
+  };
+
+  // 現在の月のカレンダー日付をメモ化
+  const datesOfMonth = useMemo(() => generateDates(currentDate.getFullYear(), currentDate.getMonth()), [currentDate]);
+
+  // 新しいスタッフを追加する関数
+  const handleAddStaff = () => {
+    if (newStaff.name.trim() !== '') {
+      const newStaffEntry = {
+        id: crypto.randomUUID(), // ユニークIDを生成
+        name: newStaff.name,
+        type: newStaff.type,
+        canWorkLate: newStaff.canWorkLate,
+        availability: newStaff.type === '選択' 
+          ? datesOfMonth.filter(date => date !== null).reduce((acc, date) => ({ ...acc, [date]: false }), {})
+          : daysOfWeek.reduce((acc, day) => ({ ...acc, [day]: false }), {}),
+      };
+      const updatedStaffs = [...staffs, newStaffEntry];
+      setStaffs(updatedStaffs);
+      setNewStaff({ name: '', type: '選択', canWorkLate: true });
+      setShowResult(false);
+      handleSaveData(updatedStaffs, generatedShift);
+    }
+  };
+
+  // スタッフ編集モーダルを開く関数
+  const handleOpenEditModal = (staff) => {
+    setStaffToEdit(staff);
+    // モーダルで編集するためのデータをコピー
+    setTempEditData({
+      id: staff.id,
+      name: staff.name,
+      type: staff.type,
+      canWorkLate: staff.canWorkLate,
+      availability: { ...staff.availability }
+    });
+    setIsEditModalOpen(true);
+  };
+  
+  // スタッフ編集モーダルでの入力変更をハンドリング
+  const handleEditChange = (e) => {
+    const { name, value, type, checked } = e.target;
+    setTempEditData(prev => ({
+      ...prev,
+      [name]: type === 'checkbox' ? checked : value
+    }));
+    // シフトタイプが変更された場合、アベイラビリティを初期化
+    if (name === 'type') {
+      let newAvailability = {};
+      if (value === '選択') {
+        newAvailability = datesOfMonth.filter(date => date !== null).reduce((acc, date) => ({ ...acc, [date]: false }), {});
+      } else if (value === '固定') {
+        newAvailability = daysOfWeek.reduce((acc, day) => ({ ...acc, [day]: false }), {});
+      }
+      setTempEditData(prev => ({ ...prev, availability: newAvailability }));
+    }
+  };
+
+  // 編集モーダルでの出勤可能日/曜日の変更をハンドリング
+  const handleTempAvailabilityChange = (key, isChecked) => {
+    setTempEditData(prev => ({
+      ...prev,
+      availability: {
+        ...prev.availability,
+        [key]: isChecked
+      }
+    }));
+  };
+
+  // スタッフ情報を保存する関数
+  const handleSaveStaff = () => {
+    const updatedStaffs = staffs.map(staff =>
+      staff.id === tempEditData.id
+        ? { ...tempEditData }
+        : staff
+    );
+    setStaffs(updatedStaffs);
+    setIsEditModalOpen(false);
+    setStaffToEdit(null);
+    setTempEditData(null);
+    setShowResult(false);
+    handleSaveData(updatedStaffs, generatedShift);
+  };
+
+  // スタッフを削除する関数（確認モーダルを開く）
+  const handleOpenDeleteConfirm = (staffId) => {
+    setStaffToDeleteId(staffId);
+    setIsConfirmModalOpen(true);
+  };
+
+  // 削除を確定する関数
+  const handleConfirmDelete = () => {
+    const updatedStaffs = staffs.filter(staff => staff.id !== staffToDeleteId);
+    setStaffs(updatedStaffs);
+    setIsConfirmModalOpen(false);
+    setStaffToDeleteId(null);
+    setShowResult(false);
+    handleSaveData(updatedStaffs, {}); // シフト表をリセット
+  };
+  
+  // 表示対象の日付を計算
+  const getDisplayDates = useMemo(() => {
+    return datesOfMonth.filter(date => date !== null).filter(date => {
+      if (selectedPeriod === 'firstHalf') return date <= 15;
+      if (selectedPeriod === 'secondHalf') return date >= 16;
+      return true;
+    });
+  }, [datesOfMonth, selectedPeriod]);
+
+  // シフトを自動生成する関数
+  const generateShift = () => {
+    // 既存のシフトをコピー
+    const newShift = { ...generatedShift };
+    
+    // 生成対象の日付を決定
+    const daysToGenerate = datesOfMonth.filter(date => date !== null);
+    
+    // 全ての日付を初期化
+    daysToGenerate.forEach(date => {
+      const dayOfWeek = daysOfWeek[new Date(currentDate.getFullYear(), currentDate.getMonth(), date).getDay()];
+      newShift[date] = { staff: [], workingHours: workingHoursPerDay[dayOfWeek] || ['ー'] };
+      if (dayOfWeek === '月') {
+        newShift[date].staff.push({ name: '定休日', time: '定休日' });
+      }
+    });
+
+    const staffAssignments = staffs.reduce((acc, staff) => ({ ...acc, [staff.id]: 0 }), {});
+    
+    const selectableStaffs = staffs.filter(s => s.type === '選択');
+    const fixedStaffs = staffs.filter(s => s.type === '固定');
+    const freeStaffs = staffs.filter(s => s.type === 'フリー');
+
+    // スタッフをシフトに割り当てるメインロジック
+    const assignStaff = (staffList, shiftMap) => {
+      daysToGenerate.forEach(date => {
+        const dayOfWeek = daysOfWeek[new Date(currentDate.getFullYear(), currentDate.getMonth(), date).getDay()];
+        const needed = staffNeededPerDay[dayOfWeek];
+        if (!needed || shiftMap[date].staff.length >= needed) return; // 必要な人数に達していたらスキップ
+        
+        const assignedHours = new Set(shiftMap[date].staff.map(s => s.time));
+
+        let availableHours = [...workingHoursPerDay[dayOfWeek]].filter(hours => !assignedHours.has(hours));
+        
+        // 土曜日の場合、遅番可能なスタッフを優先的に割り当てる
+        if (dayOfWeek === '土') {
+            const sortedAvailableHours = [...availableHours].sort((a, b) => {
+                const isLateShiftA = a.includes('19:00-23:00');
+                const isLateShiftB = b.includes('19:00-23:00');
+                if (isLateShiftA && !isLateShiftB) return -1;
+                if (!isLateShiftA && isLateShiftB) return 1;
+                return 0;
+            });
+            availableHours = sortedAvailableHours;
+        }
+        
+        // 必要な人数まで割り当てを試みる
+        while (shiftMap[date].staff.length < needed && availableHours.length > 0) {
+          const nextHour = availableHours.shift(); // 割り当てる時間を取得
+          
+          const availableStaffs = staffList.filter(staff => {
+            if (staff.type === '選択' && staff.availability[date] && !assignedHours.has(nextHour)) {
+              return true;
+            }
+            if (staff.type === '固定' && staff.availability[dayOfWeek] && !assignedHours.has(nextHour)) {
+              return true;
+            }
+            if (staff.type === 'フリー' && !assignedHours.has(nextHour)) {
+              return true;
+            }
+            return false;
+          });
+
+          // 遅番シフトの場合、遅番可能なスタッフに限定
+          const isLateShift = nextHour === '19:00-23:00';
+          const lateShiftStaffs = availableStaffs.filter(s => s.canWorkLate);
+          const staffPool = isLateShift && lateShiftStaffs.length > 0 ? lateShiftStaffs : availableStaffs;
+          
+          if (staffPool.length > 0) {
+            const sortedStaffs = staffPool.sort((a, b) => staffAssignments[a.id] - staffAssignments[b.id]);
+            const selectedStaff = sortedStaffs[0];
+            
+            if (!shiftMap[date].staff.find(s => s.name === selectedStaff.name)) {
+                shiftMap[date].staff.push({ name: selectedStaff.name, time: nextHour });
+                staffAssignments[selectedStaff.id]++;
+            } else {
+              const nextAvailable = sortedStaffs.find(s => !shiftMap[date].staff.find(assigned => assigned.name === s.name));
+              if (nextAvailable) {
+                  shiftMap[date].staff.push({ name: nextAvailable.name, time: nextHour });
+                  staffAssignments[nextAvailable.id]++;
+              } else {
+                  break;
+              }
+            }
+          } else {
+              break;
+          }
+        }
+      });
+    };
+
+    assignStaff(selectableStaffs, newShift);
+    assignStaff(fixedStaffs, newShift);
+    assignStaff(freeStaffs, newShift);
+    
+    // 割り当てられなかった日を「未定」にする
+    Object.keys(newShift).forEach(date => {
+      const dayOfWeek = daysOfWeek[new Date(currentDate.getFullYear(), currentDate.getMonth(), date).getDay()];
+      if (newShift[date].staff.length === 0 && dayOfWeek !== '月') {
+        newShift[date].staff.push({ name: '未定', time: 'ー' });
+      }
+    });
+
+    setGeneratedShift(newShift);
+    setShowResult(true);
+    handleSaveData(staffs, newShift);
+  };
+  
+  // シフトの勤務時間を手動で編集する関数
+  const handleShiftTimeChange = (date, staffName, newTime) => {
+    setGeneratedShift(prevShift => {
+      const updatedDateEntry = { ...prevShift[date] };
+      const updatedStaffs = updatedDateEntry.staff.map(assignedStaff => {
+        if (assignedStaff.name === staffName) {
+          return { ...assignedStaff, time: newTime };
+        }
+        return assignedStaff;
+      });
+      const updatedShift = {
+        ...prevShift,
+        [date]: { ...updatedDateEntry, staff: updatedStaffs }
+      };
+      handleSaveData(staffs, updatedShift);
+      return updatedShift;
+    });
+  };
+  
+  // Firestoreにデータを保存する関数
+  const handleSaveData = async (staffData, shiftData) => {
+    if (!db || !userId) {
+      showCustomAlert('データベースに接続できません。再度お試しください。');
+      return;
+    }
+    
+    const docRef = doc(db, 'artifacts', appId, 'users', userId, 'shift_data', 'user_data');
+    
+    try {
+      await setDoc(docRef, {
+        staffs: staffData,
+        generatedShift: shiftData,
+      }, { merge: true });
+      showCustomAlert('シフトデータが保存されました。');
+    } catch (error) {
+      showCustomAlert('データの保存に失敗しました。');
+      console.error('保存に失敗しました:', error);
+    }
+  };
+
+  // Firestoreからデータを手動で読み込む関数
+  const handleLoadData = async () => {
+    if (!db || !userId) {
+      showCustomAlert('データベースに接続できません。再度お試しください。');
+      return;
+    }
+    
+    const docRef = doc(db, 'artifacts', appId, 'users', userId, 'shift_data', 'user_data');
+    
+    try {
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setStaffs(data.staffs);
+        setGeneratedShift(data.generatedShift);
+        if (data.generatedShift && Object.keys(data.generatedShift).length > 0) {
+          setShowResult(true);
+        } else {
+          setShowResult(false);
+        }
+        showCustomAlert('シフトデータが読み込まれました。');
+      } else {
+        showCustomAlert('保存されたデータはありません。');
+        setStaffs([]);
+        setGeneratedShift({});
+        setShowResult(false);
+      }
+    } catch (error) {
+      showCustomAlert('データの読み込みに失敗しました。');
+      console.error('読み込みに失敗しました:', error);
+    }
+  };
+
+  // シフト表をExcelで出力する関数
+  const handleExportExcel = () => {
+    if (!isXLSXLoaded || typeof window.XLSX === 'undefined') {
+      showCustomAlert('Excel出力ライブラリの読み込みが完了していません。しばらく待ってから再度お試しください。');
+      return;
+    }
+    
+    const displayDates = getDisplayDates;
+
+    if (Object.keys(generatedShift).length === 0) {
+      showCustomAlert('出力するシフト表がありません。');
+      return;
+    }
+    
+    try {
+      const data = [];
+      const headerRow = ['日付', '曜日'];
+      const staffNames = staffs.map(staff => staff.name);
+      headerRow.push(...staffNames);
+      data.push(headerRow);
+
+      const sortedDates = displayDates.sort((a, b) => parseInt(a) - parseInt(b));
+      sortedDates.forEach(date => {
+        const dayOfWeek = daysOfWeek[new Date(currentDate.getFullYear(), currentDate.getMonth(), parseInt(date)).getDay()];
+        const row = [date, dayOfWeek];
+        
+        staffNames.forEach(staffName => {
+          const assignedStaff = generatedShift[date] && generatedShift[date].staff.find(s => s.name === staffName);
+          row.push(assignedStaff ? assignedStaff.time : 'ー');
+        });
+        
+        data.push(row);
+      });
+
+      const worksheet = window.XLSX.utils.aoa_to_sheet(data);
+      const workbook = window.XLSX.utils.book_new();
+      window.XLSX.utils.book_append_sheet(workbook, worksheet, 'シフト表');
+      window.XLSX.writeFile(workbook, `シフト表_${currentDate.getFullYear()}_${currentDate.getMonth() + 1}.xlsx`);
+      showCustomAlert('Excelファイルをダウンロードしました。');
+    } catch (e) {
+      console.error("Excel出力に失敗しました:", e);
+      showCustomAlert('Excel出力中にエラーが発生しました。');
+    }
+  };
+
+  // 前の月に移動
+  const handlePrevMonth = () => {
+    setCurrentDate(prevDate => new Date(prevDate.getFullYear(), prevDate.getMonth() - 1, 1));
+  };
+
+  // 次の月に移動
+  const handleNextMonth = () => {
+    setCurrentDate(prevDate => new Date(prevDate.getFullYear(), prevDate.getMonth() + 1, 1));
+  };
+  
+  // シフト編集用の入力コンポーネント
+  const ShiftInput = ({ date, staffName, initialValue }) => {
+    const [value, setValue] = useState(initialValue);
+    const [isEditing, setIsEditing] = useState(false);
+
+    const handleKeyDown = (e) => {
+      if (e.key === 'Enter') {
+        handleShiftTimeChange(date, staffName, value);
+        setIsEditing(false);
+      }
+    };
+    
+    const handleBlur = () => {
+      handleShiftTimeChange(date, staffName, value);
+      setIsEditing(false);
+    };
+
+    return (
+      <div className="py-1 px-2 rounded-lg transition-colors duration-200 cursor-pointer text-purple-700 font-semibold" onClick={() => setIsEditing(true)}>
+        {isEditing ? (
+          <input
+            type="text"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={handleKeyDown}
+            onBlur={handleBlur}
+            autoFocus
+            className="w-full text-center bg-gray-100 border border-purple-500 rounded-md outline-none"
+          />
+        ) : (
+          <span>{value || 'ー'}</span>
+        )}
+      </div>
+    );
+  };
+  
+  return (
+    <div className="bg-gray-100 min-h-screen p-4 sm:p-8 flex flex-col items-center font-sans">
+      <div className="bg-white shadow-xl rounded-2xl p-6 sm:p-10 w-full max-w-4xl">
+        <h1 className="text-3xl sm:text-4xl font-bold text-center text-gray-800 mb-6 sm:mb-8">
+          シフト自動生成アプリ
+        </h1>
+
+        {/* データベース接続状況 */}
+        {isLoading && (
+          <div className="flex items-center justify-center mb-4 text-lg font-semibold text-gray-600">
+            <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-gray-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            データベースに接続中...
+          </div>
+        )}
+        
+        {/* 新しいスタッフを追加するセクション */}
+        <div className="mb-8">
+          <h2 className="text-2xl font-semibold text-gray-700 mb-4">新しいスタッフを追加</h2>
+          <div className="flex flex-col sm:flex-row gap-4 mb-4">
+            <input
+              type="text"
+              placeholder="スタッフの名前"
+              value={newStaff.name}
+              onChange={(e) => setNewStaff({ ...newStaff, name: e.target.value })}
+              className="flex-grow p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all duration-200"
+            />
+          </div>
+          <div className="flex flex-col sm:flex-row items-center gap-4 mb-4">
+            <div className="text-gray-600 font-medium">シフトタイプ:</div>
+            <label className="inline-flex items-center">
+              <input
+                type="radio"
+                name="shiftType"
+                value="固定"
+                checked={newStaff.type === '固定'}
+                onChange={(e) => setNewStaff({ ...newStaff, type: e.target.value })}
+                className="form-radio h-5 w-5 text-blue-600"
+              />
+              <span className="ml-2 text-gray-800">固定</span>
+            </label>
+            <label className="inline-flex items-center">
+              <input
+                type="radio"
+                name="shiftType"
+                value="選択"
+                checked={newStaff.type === '選択'}
+                onChange={(e) => setNewStaff({ ...newStaff, type: e.target.value })}
+                className="form-radio h-5 w-5 text-blue-600"
+              />
+              <span className="ml-2 text-gray-800">選択</span>
+            </label>
+            <label className="inline-flex items-center">
+              <input
+                type="radio"
+                name="shiftType"
+                value="フリー"
+                checked={newStaff.type === 'フリー'}
+                onChange={(e) => setNewStaff({ ...newStaff, type: e.target.value })}
+                className="form-radio h-5 w-5 text-blue-600"
+              />
+              <span className="ml-2 text-gray-800">フリー</span>
+            </label>
+          </div>
+          <div className="flex items-center gap-2 mb-4">
+            <input
+              type="checkbox"
+              id="canWorkLate"
+              checked={newStaff.canWorkLate}
+              onChange={(e) => setNewStaff({ ...newStaff, canWorkLate: e.target.checked })}
+              className="form-checkbox h-5 w-5 text-purple-600 rounded"
+            />
+            <label htmlFor="canWorkLate" className="text-gray-800">遅番勤務可能</label>
+          </div>
+
+          <button
+            onClick={handleAddStaff}
+            disabled={isLoading}
+            className={`w-full bg-blue-600 text-white font-bold py-3 px-6 rounded-lg shadow-lg transition-all duration-300 transform ${isLoading ? 'opacity-50 cursor-not-allowed' : 'hover:bg-blue-700 hover:scale-105'}`}
+          >
+            スタッフを追加
+          </button>
+        </div>
+
+        {/* スタッフリストと設定セクション */}
+        {staffs.length > 0 && (
+          <div className="mb-8">
+            <h2 className="text-2xl font-semibold text-gray-700 mb-4">登録スタッフ</h2>
+            <div className="overflow-x-auto">
+              <table className="min-w-full bg-white rounded-lg shadow-inner">
+                <thead>
+                  <tr className="bg-gray-200 text-gray-600 uppercase text-sm leading-normal">
+                    <th className="py-3 px-4 text-left">スタッフ</th>
+                    <th className="py-3 px-4 text-center">シフトタイプ</th>
+                    <th className="py-3 px-4 text-center">遅番</th>
+                    <th className="py-3 px-4 text-center">出勤可能日/曜日</th>
+                    <th className="py-3 px-4 text-center">操作</th>
+                  </tr>
+                </thead>
+                <tbody className="text-gray-600 text-sm font-light">
+                  {staffs.map(staff => (
+                    <tr key={staff.id} className="border-b border-gray-200 hover:bg-gray-100 transition-colors duration-200">
+                      <td className="py-3 px-4 text-left font-bold">{staff.name}</td>
+                      <td className="py-3 px-4 text-center">
+                        <span className={`px-3 py-1 rounded-full font-semibold text-xs ${
+                            staff.type === '固定' ? 'bg-orange-200 text-orange-800' :
+                            staff.type === '選択' ? 'bg-blue-200 text-blue-800' :
+                            'bg-green-200 text-green-800'
+                        }`}>
+                            {staff.type}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4 text-center">
+                        {staff.canWorkLate ? (
+                          <span className="text-green-600 font-bold">可能</span>
+                        ) : (
+                          <span className="text-red-600 font-bold">不可</span>
+                        )}
+                      </td>
+                      <td className="py-3 px-4 text-center">
+                        {(staff.type === '選択' || staff.type === '固定') && (
+                          <div className="flex items-center justify-center space-x-2">
+                            {Object.entries(staff.availability).filter(([key, isAvailable]) => isAvailable).length > 0 ? (
+                              Object.entries(staff.availability)
+                                .filter(([key, isAvailable]) => isAvailable)
+                                .map(([key]) => (
+                                  <span key={key} className="bg-gray-200 text-gray-800 px-2 py-1 rounded-full text-xs font-semibold">
+                                    {key}
+                                  </span>
+                                ))
+                            ) : (
+                              <span className="text-gray-500 font-bold text-xs">未設定</span>
+                            )}
+                          </div>
+                        )}
+                         {staff.type === 'フリー' && (
+                          <span className="text-gray-500 font-bold">自動</span>
+                        )}
+                      </td>
+                      <td className="py-3 px-4 text-center space-x-2">
+                        <button
+                          onClick={() => handleOpenEditModal(staff)}
+                          className="bg-purple-500 text-white font-bold py-2 px-4 rounded-lg shadow-lg hover:bg-purple-600 transition-colors duration-200"
+                        >
+                          編集
+                        </button>
+                        <button
+                          onClick={() => handleOpenDeleteConfirm(staff.id)}
+                          className="bg-red-500 text-white font-bold py-2 px-4 rounded-lg shadow-lg hover:bg-red-600 transition-colors duration-200"
+                        >
+                          削除
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+        
+        {/* シフト生成とデータ管理ボタン */}
+        <div className="flex flex-col sm:flex-row justify-center items-center gap-4 mb-8">
+          {staffs.length > 0 && (
+             <div className="flex items-center space-x-4">
+              <label className="inline-flex items-center">
+                <input
+                  type="radio"
+                  name="shiftPeriod"
+                  value="firstHalf"
+                  checked={selectedPeriod === 'firstHalf'}
+                  onChange={(e) => setSelectedPeriod(e.target.value)}
+                  className="form-radio h-5 w-5 text-purple-600"
+                />
+                <span className="ml-2 text-gray-800">前半</span>
+              </label>
+              <label className="inline-flex items-center">
+                <input
+                  type="radio"
+                  name="shiftPeriod"
+                  value="secondHalf"
+                  checked={selectedPeriod === 'secondHalf'}
+                  onChange={(e) => setSelectedPeriod(e.target.value)}
+                  className="form-radio h-5 w-5 text-purple-600"
+                />
+                <span className="ml-2 text-gray-800">後半</span>
+              </label>
+              <label className="inline-flex items-center">
+                <input
+                  type="radio"
+                  name="shiftPeriod"
+                  value="full"
+                  checked={selectedPeriod === 'full'}
+                  onChange={(e) => setSelectedPeriod(e.target.value)}
+                  className="form-radio h-5 w-5 text-purple-600"
+                />
+                <span className="ml-2 text-gray-800">全体</span>
+              </label>
+            </div>
+          )}
+          {staffs.length > 0 && (
+            <button
+              onClick={generateShift}
+              disabled={isLoading}
+              className={`w-full sm:w-auto bg-purple-600 text-white font-bold py-4 px-8 rounded-lg shadow-lg transition-all duration-300 transform ${isLoading ? 'opacity-50 cursor-not-allowed' : 'hover:bg-purple-700 hover:scale-105'}`}
+            >
+              シフトを自動生成
+            </button>
+          )}
+          <button
+            onClick={() => handleSaveData(staffs, generatedShift)}
+            disabled={isLoading}
+            className={`w-full sm:w-auto bg-green-600 text-white font-bold py-4 px-8 rounded-lg shadow-lg transition-all duration-300 transform ${isLoading ? 'opacity-50 cursor-not-allowed' : 'hover:bg-green-700 hover:scale-105'}`}
+          >
+            データを保存
+          </button>
+          <button
+            onClick={handleLoadData}
+            disabled={isLoading}
+            className={`w-full sm:w-auto bg-gray-600 text-white font-bold py-4 px-8 rounded-lg shadow-lg transition-all duration-300 transform ${isLoading ? 'opacity-50 cursor-not-allowed' : 'hover:bg-gray-700 hover:scale-105'}`}
+          >
+            データを読み込む
+          </button>
+        </div>
+
+        {/* 生成されたシフト表の表示セクション */}
+        {showResult && (
+          <div className="mt-8">
+            <h2 className="text-2xl font-semibold text-gray-700 mb-4 text-center">
+              {currentDate.getFullYear()}年 {currentDate.getMonth() + 1}月 シフト表
+            </h2>
+            <div className="flex justify-center mb-4">
+              <button
+                onClick={handleExportExcel}
+                disabled={!isXLSXLoaded}
+                className={`bg-teal-500 text-white font-bold py-3 px-6 rounded-lg shadow-lg transition-all duration-300 transform ${!isXLSXLoaded ? 'opacity-50 cursor-not-allowed' : 'hover:bg-teal-600 hover:scale-105'}`}
+              >
+                Excelで出力
+              </button>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="min-w-full bg-white rounded-lg shadow-xl">
+                <thead>
+                  <tr className="bg-purple-200 text-purple-800 uppercase text-sm leading-normal">
+                    <th className="py-3 px-6 text-center">日にち</th>
+                    {staffs.map(staff => (
+                      <th key={staff.id} className="py-3 px-6 text-center">{staff.name}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="text-gray-700 text-sm font-light">
+                  {getDisplayDates.map(date => (
+                    <tr key={date} className="border-b border-gray-200">
+                      <td className="py-3 px-6 text-center font-bold">
+                        {date} ({daysOfWeek[new Date(currentDate.getFullYear(), currentDate.getMonth(), date).getDay()]})
+                      </td>
+                      {staffs.map(staff => {
+                        const assignedStaff = generatedShift[date] && generatedShift[date].staff.find(s => s.name === staff.name);
+                        
+                        return (
+                          <td key={staff.id} className="py-3 px-6 text-center">
+                            {assignedStaff ? (
+                              <ShiftInput
+                                date={date}
+                                staffName={staff.name}
+                                initialValue={assignedStaff.time}
+                              />
+                            ) : (
+                              <span>ー</span>
+                            )}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* スタッフ編集モーダル */}
+      {isEditModalOpen && tempEditData && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl p-6 shadow-xl w-full max-w-lg flex flex-col h-full max-h-[90vh] sm:max-h-auto sm:h-auto">
+            <h3 className="text-2xl font-semibold text-gray-800 mb-6 text-center shrink-0">スタッフ情報を編集</h3>
+            <div className="flex-grow overflow-y-auto pr-2">
+              <div className="space-y-4 mb-6">
+                {/* 名前 */}
+                <div>
+                  <label className="block text-gray-700 font-bold mb-1">名前</label>
+                  <input
+                    type="text"
+                    name="name"
+                    value={tempEditData.name}
+                    onChange={handleEditChange}
+                    className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+
+                {/* シフトタイプ */}
+                <div>
+                  <label className="block text-gray-700 font-bold mb-1">シフトタイプ</label>
+                  <div className="flex gap-4">
+                    <label className="inline-flex items-center">
+                      <input type="radio" name="type" value="固定" checked={tempEditData.type === '固定'} onChange={handleEditChange} className="form-radio h-5 w-5 text-blue-600" />
+                      <span className="ml-2 text-gray-800">固定</span>
+                    </label>
+                    <label className="inline-flex items-center">
+                      <input type="radio" name="type" value="選択" checked={tempEditData.type === '選択'} onChange={handleEditChange} className="form-radio h-5 w-5 text-blue-600" />
+                      <span className="ml-2 text-gray-800">選択</span>
+                    </label>
+                    <label className="inline-flex items-center">
+                      <input type="radio" name="type" value="フリー" checked={tempEditData.type === 'フリー'} onChange={handleEditChange} className="form-radio h-5 w-5 text-blue-600" />
+                      <span className="ml-2 text-gray-800">フリー</span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* 遅番勤務可否 */}
+                <div className="flex items-center gap-2">
+                  <input type="checkbox" id="editCanWorkLate" name="canWorkLate" checked={tempEditData.canWorkLate} onChange={handleEditChange} className="form-checkbox h-5 w-5 text-purple-600 rounded" />
+                  <label htmlFor="editCanWorkLate" className="text-gray-800">遅番勤務可能</label>
+                </div>
+              </div>
+
+              {/* 出勤可能日/曜日の選択セクション */}
+              {(tempEditData.type === '選択' || tempEditData.type === '固定') && (
+                <div className="mb-6">
+                  <h4 className="text-lg font-semibold text-gray-800 mb-3 text-center">
+                    {tempEditData.type === '固定' ? '出勤可能な曜日を選択' : '出勤可能な日付を選択'}
+                  </h4>
+                  {tempEditData.type === '固定' && (
+                    <div className="grid grid-cols-4 gap-4">
+                      {daysOfWeek.map(day => (
+                        <button
+                          key={day}
+                          onClick={() => handleTempAvailabilityChange(day, !tempEditData.availability[day])}
+                          disabled={day === '月'}
+                          className={`py-3 px-2 rounded-lg font-bold transition-all duration-200 transform ${
+                            tempEditData.availability[day] ? 'bg-blue-500 text-white shadow-md' : 'bg-gray-200 text-gray-700'
+                          } ${day === '月' ? 'opacity-50 cursor-not-allowed' : 'hover:scale-105'}`}
+                        >
+                          {day}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {tempEditData.type === '選択' && (
+                    <>
+                      <div className="flex justify-between items-center mb-4">
+                        <button onClick={handlePrevMonth} className="p-2 rounded-full hover:bg-gray-200 transition-colors duration-200">
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                          </svg>
+                        </button>
+                        <h4 className="text-lg font-semibold text-gray-800">
+                          {currentDate.getFullYear()}年 {currentDate.getMonth() + 1}月
+                        </h4>
+                        <button onClick={handleNextMonth} className="p-2 rounded-full hover:bg-gray-200 transition-colors duration-200">
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                          </svg>
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-7 gap-2 text-center">
+                        {daysOfWeek.map(day => (
+                          <div key={day} className="text-sm font-bold text-gray-500">{day}</div>
+                        ))}
+                        {datesOfMonth.map((date, index) => {
+                          if (date === null) {
+                            return <div key={`empty-${index}`} className="py-2 px-1"></div>;
+                          }
+                          const dayOfWeek = daysOfWeek[new Date(currentDate.getFullYear(), currentDate.getMonth(), date).getDay()];
+                          return (
+                            <button
+                              key={date}
+                              onClick={() => handleTempAvailabilityChange(date, !tempEditData.availability[date])}
+                              disabled={dayOfWeek === '月'}
+                              className={`py-2 px-1 rounded-lg transition-all duration-200 transform ${
+                                tempEditData.availability[date] ? 'bg-blue-500 text-white shadow-md' : 'bg-gray-200 text-gray-700'
+                              } ${dayOfWeek === '月' ? 'opacity-50 cursor-not-allowed' : 'hover:scale-105'}`}
+                            >
+                              {date}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+            
+            <div className="flex justify-center gap-4 mt-6 shrink-0">
+              <button
+                onClick={handleSaveStaff}
+                className="bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-lg hover:bg-green-700 transition-all duration-300 transform hover:scale-105"
+              >
+                変更を保存
+              </button>
+              <button
+                onClick={() => setIsEditModalOpen(false)}
+                className="bg-gray-400 text-white font-bold py-3 px-6 rounded-lg shadow-lg hover:bg-gray-500 transition-all duration-300 transform hover:scale-105"
+              >
+                キャンセル
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 削除確認モーダル */}
+      {isConfirmModalOpen && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl p-6 shadow-xl w-full max-w-md text-center">
+            <h3 className="text-2xl font-semibold text-gray-800 mb-4">スタッフを削除しますか？</h3>
+            <p className="text-gray-600 mb-6">この操作は元に戻せません。</p>
+            <div className="flex justify-center gap-4">
+              <button
+                onClick={handleConfirmDelete}
+                className="bg-red-600 text-white font-bold py-3 px-6 rounded-lg shadow-lg hover:bg-red-700 transition-all duration-300"
+              >
+                削除
+              </button>
+              <button
+                onClick={() => setIsConfirmModalOpen(false)}
+                className="bg-gray-400 text-white font-bold py-3 px-6 rounded-lg shadow-lg hover:bg-gray-500 transition-all duration-300"
+              >
+                キャンセル
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* カスタムアラート */}
+      {customAlert.visible && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 bg-gray-800 text-white px-6 py-3 rounded-xl shadow-lg z-50 transition-transform duration-300 animate-slide-up">
+          {customAlert.message}
+        </div>
+      )}
+      {userId && (
+        <div className="mt-8 text-center text-sm text-gray-500">
+          <p>あなたのユーザーID: {userId}</p>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default App;
